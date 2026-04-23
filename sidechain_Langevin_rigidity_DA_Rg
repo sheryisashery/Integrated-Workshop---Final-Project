@@ -1,0 +1,158 @@
+# try4
+# 3-bead residue structure, Langevin dynamics,
+# stiff torsional constraints (angles and dihedrals), and a crowding environment
+# simulation temperature range of 10–60°C
+# output: D/A ratio, Rg
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def get_angle(a, b, c):
+    """Calculates the angle between three points (a-b-c) in radians."""
+    ba = a - b
+    bc = c - b
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9)
+    return np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+
+def get_dihedral(p0, p1, p2, p3):
+    """Calculates the dihedral angle between four points (p0-p1-p2-p3)."""
+    b0 = -1.0 * (p1 - p0)
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b1 /= np.linalg.norm(b1)
+    v = b0 - np.dot(b0, b1) * b1
+    w = b2 - np.dot(b2, b1) * b1
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b1, v), w)
+    return np.arctan2(y, x)
+
+
+def run_protein_sim(temp_c, crowding=False):
+    # 1. Unit Mapping (Celsius to Sim Units)
+    temp_sim = 0.5 + (temp_c - 10) * (4.0 / 50.0)
+
+    # 2. Parameters
+    N_res = 14
+    N = N_res * 3  # 3 beads per residue
+    dt, steps = 0.01, 15000
+    gamma, kb, R0 = 0.8, 1.0, 3.8
+    k_bond, k_angle, k_dihed, k_native = 400.0, 60.0, 15.0, 22.0
+
+    # 3. Initialization
+    pos = np.zeros((N, 3))
+    for i in range(N_res):
+        pos[3*i]   = [i * 1.1, 0, 0]    # Backbone
+        pos[3*i+1] = [i * 1.1, 0.6, 0]  # Sidechain Beta
+        pos[3*i+2] = [i * 1.1, 1.1, 0]  # Sidechain Gamma
+
+    vel = np.random.normal(0, np.sqrt(kb * temp_sim), (N, 3))
+    da_ratios = []
+    rg_values = []
+
+    # 4. Main Integration Loop
+    for s in range(steps):
+        forces = np.zeros((N, 3))
+
+        # --- A. BOND FORCES ---
+        for i in range(N_res):
+            idx_ca, idx_cb, idx_cg = 3*i, 3*i+1, 3*i+2
+            for pair in [(idx_ca, idx_cb, 0.6), (idx_cb, idx_cg, 0.5)]:
+                r = pos[pair[1]] - pos[pair[0]]
+                d = np.linalg.norm(r)
+                f = k_bond * (d - pair[2]) * (r / (d + 1e-9))
+                forces[pair[0]] += f
+                forces[pair[1]] -= f
+            if i < N_res - 1:
+                r_bb = pos[3*(i+1)] - pos[idx_ca]
+                d_bb = np.linalg.norm(r_bb)
+                f_bb = k_bond * (d_bb - 1.1) * (r_bb / (d_bb + 1e-9))
+                forces[idx_ca] += f_bb
+                forces[3*(i+1)] -= f_bb
+
+        # --- B. TORSIONAL FORCES ---
+        for i in range(1, N_res - 1):
+            idx_p, idx_c, idx_n = 3*(i-1), 3*i, 3*(i+1)
+            theta = get_angle(pos[idx_p], pos[idx_c], pos[idx_n])
+            diff = theta - 1.92
+            restore_vec = pos[idx_c] - (pos[idx_p] + pos[idx_n])/2
+            forces[idx_c] += k_angle * diff * (restore_vec / (np.linalg.norm(restore_vec) + 1e-9))
+
+        for i in range(N_res - 3):
+            idxs = [3*(i+j) for j in range(4)]
+            phi = get_dihedral(pos[idxs[0]], pos[idxs[1]], pos[idxs[2]], pos[idxs[3]])
+            f_mag = -k_dihed * np.sin(phi - (-1.0))
+            forces[idxs[1]] += f_mag * np.array([0, 1, 0])
+            forces[idxs[2]] -= f_mag * np.array([0, 1, 0])
+
+        # --- C. NATIVE CONTACTS ---
+        for i in range(0, N-12, 3):
+            r_nc = pos[i+12] - pos[i]; d_nc = np.linalg.norm(r_nc)
+            if d_nc < 4.5:
+                f_nc = k_native * (d_nc - 1.3) * (r_nc / (d_nc + 1e-9))
+                forces[i] += f_nc; forces[i+12] -= f_nc
+
+        # --- D. CROWDING ---
+        if crowding:
+            boundary = 3.5 
+            for i in range(N):
+                dist_center = np.linalg.norm(pos[i])
+                if dist_center > boundary:
+                    forces[i] -= 150.0 * (dist_center - boundary) * (pos[i]/dist_center)
+
+        # --- E. LANGEVIN INTEGRATOR ---
+        noise = np.random.normal(0, np.sqrt(2 * gamma * kb * temp_sim / dt), (N, 3))
+        vel = vel + (forces - gamma * vel + noise) * dt
+        pos = pos + vel * dt
+
+        # --- F. DATA COLLECTION (After equilibrium) ---
+        if s > 7000:
+            # 1. D/A Ratio
+            dist_fret = np.linalg.norm(pos[0] - pos[3*(N_res-1)])
+            eff = 1.0 / (1.0 + (dist_fret/R0)**6)
+            da_ratios.append((1.0 - eff) / (eff + 1e-6))
+            
+            # 2. Radius of Gyration (Rg)
+            # Calculated for all beads in the model
+            center_of_mass = np.mean(pos, axis=0)
+            sq_distances = np.sum((pos - center_of_mass)**2, axis=1)
+            rg = np.sqrt(np.mean(sq_distances))
+            rg_values.append(rg)
+
+    return np.mean(da_ratios), np.mean(rg_values)
+
+# run sim
+temps_range = np.linspace(10, 60, 15)
+
+print("Running Dilute simulations...")
+results_dilute = [run_protein_sim(t, False) for t in temps_range]
+da_dilute = [res[0] for res in results_dilute]
+rg_dilute = [res[1] for res in results_dilute]
+
+print("Running Crowded simulations...")
+results_crowded = [run_protein_sim(t, True) for t in temps_range]
+da_crowded = [res[0] for res in results_crowded]
+rg_crowded = [res[1] for res in results_crowded]
+
+# plot
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Panel 1: D/A ratio
+ax1.plot(temps_range, da_dilute, 'ko-', label='In Vitro (Dilute)')
+ax1.plot(temps_range, da_crowded, 'ro-', label='In Vivo (Crowded)')
+ax1.set_xlabel('Temperature (°C)', fontsize=12)
+ax1.set_ylabel('Donor / Acceptor Ratio', fontsize=12)
+ax1.set_title('Local End-to-End Distance (FRET)', fontsize=14)
+ax1.legend()
+ax1.grid(True, alpha=0.2)
+
+# Panel 2: Rg
+ax2.plot(temps_range, rg_dilute, 'ks-', label='In Vitro (Dilute)')
+ax2.plot(temps_range, rg_crowded, 'rs-', label='In Vivo (Crowded)')
+ax2.set_xlabel('Temperature (°C)', fontsize=12)
+ax2.set_ylabel('Radius of Gyration ($R_g$)', fontsize=12)
+ax2.set_title('Global Structural Compactness ($R_g$)', fontsize=14)
+ax2.legend()
+ax2.grid(True, alpha=0.2)
+
+plt.tight_layout()
+plt.show()
