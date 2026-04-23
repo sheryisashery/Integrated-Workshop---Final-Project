@@ -1,0 +1,124 @@
+# try 3 
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def run_langevin_sim_with_rg(temp_c, crowding=False):
+    # celsius to sim unti (10C -> 0.5, 60C -> 4.5)
+    temp_sim = 0.5 + (temp_c - 10) * (4.0 / 50.0)
+    
+    # parameters
+    N_res, dt, steps = 14, 0.01, 5000
+    N = N_res * 2 # total beads (backbone + sidechain)
+    gamma = 0.8  # friction
+    kb = 1.0 # Boltzmann constant in sim units
+    
+    # initial position
+    pos = np.zeros((N, 3))
+    for i in range(N_res):
+        pos[2*i] = [i * 1.1, 0, 0]      # backbone (every even bead)
+        pos[2*i+1] = [i * 1.1, 0.6, 0]  # sidechain (every odd bead)
+    vel = np.random.normal(0, np.sqrt(kb * temp_sim), (N, 3))
+    
+    da_ratios = []
+    rg_values = []
+
+    for s in range(steps):
+        forces = np.zeros((N, 3))
+        
+        # conservative forces
+        for i in range(N_res):
+            b, sc = 2*i, 2*i+1
+            # sidechain bond
+            r = pos[sc] - pos[b]; d = np.linalg.norm(r)
+            forces[b] += 300 * (d - 0.7) * (r/d)
+            forces[sc] -= 300 * (d - 0.7) * (r/d)
+            # backbone chain
+            if i < N_res - 1:
+                rb = pos[2*(i+1)] - pos[b]; db = np.linalg.norm(rb)
+                forces[b] += 300 * (db - 1.0) * (rb/db)
+                forces[2*(i+1)] -= 300 * (db - 1.0) * (rb/db)
+
+        # Native Contacts (The Folding Logic)
+        for i in range(0, N-8, 2):
+            r = pos[i+8] - pos[i]; d = np.linalg.norm(r)
+            if d < 4.0:
+                forces[i] += 18.0 * (d - 1.2) * (r/d)
+                forces[i+8] -= 18.0 * (d - 1.2) * (r/d)
+
+        # crowding
+        if crowding:
+            box_limit = 3.5 
+            for i in range(N):
+                d_c = np.linalg.norm(pos[i])
+                if d_c > box_limit: forces[i] -= 150 * (d_c - box_limit) * (pos[i]/d_c)
+
+        # 4. Langevin dynamics
+        # R(t) thermal noise scaled with sqrt(dt)
+        noise = np.random.normal(0, np.sqrt(2 * gamma * kb * temp_sim / dt), (N, 3))
+        
+        vel = vel + (forces - gamma * vel + noise) * dt
+        pos = pos + vel * dt
+
+        # equilibrium sampling after step 7000
+        if s > 4000:
+            # calculate D/A ratio
+            # Donor: pos[0] (N-terminus)
+            # Acceptor: pos[2*(14-1)] = pos[26] (C-terminus)
+            dist = np.linalg.norm(pos[0] - pos[2*(N_res-1)])
+            r0 = 3.5  # Förster radius
+            # FRET E = 1 / (1 + (r/R0)^6)
+            eff = 1.0 / (1.0 + (dist/r0)**6)
+            # D/A approximated as (1-E)/E
+            da_ratios.append((1.0 - eff) / (eff + 1e-5))
+            
+            # Rg
+            center_of_mass = np.mean(pos, axis=0)
+            displacements_sq = np.sum((pos - center_of_mass)**2, axis=1) # vectorized distance
+            rg = np.sqrt(np.mean(displacements_sq)) # Root of the mean square displacement
+            rg_values.append(rg)
+
+    # return averaged values over the equilibrium ensemble
+    return np.mean(da_ratios), np.mean(rg_values)
+
+# run and plot
+temps_real = np.linspace(10, 60, 15)
+
+# storage
+da_dilute, rg_dilute = [], []
+da_crowded, rg_crowded = [], []
+
+# execute simulations
+for t in temps_real:
+    # run and unpack returns
+    da_d, rg_d = run_langevin_sim_with_rg(t, crowding=False)
+    da_c, rg_c = run_langevin_sim_with_rg(t, crowding=True)
+    
+    da_dilute.append(da_d)
+    rg_dilute.append(rg_d)
+    da_crowded.append(da_c)
+    rg_crowded.append(rg_c)
+
+# plot
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Panel 1: D/A ratio
+ax1.plot(temps_real, da_dilute, 'ko-', label='In Vitro (Dilute)')
+ax1.plot(temps_real, da_crowded, 'ro-', label='In Vivo (Crowded)')
+ax1.set_xlabel('Temperature (°C)')
+ax1.set_ylabel('Donor / Acceptor Ratio (sim units)')
+ax1.set_title('D/A Ratio vs. Temperature')
+ax1.legend()
+ax1.grid(True, alpha=0.2)
+
+# Panel 2: Rb
+ax2.plot(temps_real, rg_dilute, 'ks-', label='In Vitro (Dilute)')
+ax2.plot(temps_real, rg_crowded, 'rs-', label='In Vivo (Crowded)')
+ax2.set_xlabel('Temperature (°C)')
+ax2.set_ylabel('Radius of Gyration (sim units)')
+ax2.set_title('$R_g$ vs. Temperature')
+ax2.legend()
+ax2.grid(True, alpha=0.2)
+
+plt.tight_layout()
+plt.show()
